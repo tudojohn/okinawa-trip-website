@@ -1,0 +1,25 @@
+import express from 'express';
+import cors from 'cors';
+import {db} from './db.js';
+import path from 'node:path';
+import multer from 'multer';
+import {parseItinerary} from './parser.js';
+
+const app=express();
+app.use(cors()); app.use(express.json({limit:'1mb'}));
+app.use(express.static(path.resolve('.')));
+const upload=multer({dest:path.resolve('server/uploads'),limits:{fileSize:10*1024*1024},fileFilter:(_,file,cb)=>cb(null,/\.(docx|pdf|xlsx|xls|csv|txt|md)$/i.test(file.originalname))});
+const ok=(res,data)=>res.json({success:true,...data});
+const fail=(res,error,status=400)=>res.status(status).json({success:false,error});
+app.get('/api/health',(_,res)=>ok(res,{service:'okinawa-itinerary-api'}));
+app.get('/api/trips',(_,res)=>ok(res,{trips:db.prepare('SELECT * FROM trips ORDER BY id DESC').all()}));
+app.post('/api/trips',(req,res)=>{const name=String(req.body.name||'未命名旅程').trim();const r=db.prepare('INSERT INTO trips(name,created_at) VALUES(?,?)').run(name,new Date().toISOString());ok(res,{trip:db.prepare('SELECT * FROM trips WHERE id=?').get(r.lastInsertRowid)});});
+app.get('/api/trips/:id/items',(req,res)=>ok(res,{items:db.prepare('SELECT * FROM itinerary_items WHERE trip_id=? ORDER BY date,time,sort_order,id').all(req.params.id)}));
+app.post('/api/trips/:id/import',upload.single('file'),async(req,res)=>{if(!req.file)return fail(res,'請上傳 DOCX、PDF 或 Excel 檔案');try{const parsed=await parseItinerary(req.file.path,req.file.originalname);const insert=db.prepare('INSERT INTO itinerary_items(trip_id,date,time,title,description,category,sort_order) VALUES(?,?,?,?,?,?,?)');const tx=db.transaction(items=>items.map(x=>insert.run(req.params.id,x.date,x.time,x.title,x.description,x.category,x.sort_order).lastInsertRowid));const ids=tx(parsed.items);ok(res,{sourceName:parsed.sourceName,count:parsed.items.length,items:parsed.items.map((x,i)=>({...x,id:Number(ids[i])}))});}catch(e){fail(res,e.message);}finally{if(req.file)await import('node:fs/promises').then(fs=>fs.unlink(req.file.path).catch(()=>{}));}});
+app.post('/api/trips/:id/items',(req,res)=>{const d=req.body;if(!d.title)return fail(res,'title 為必填');const r=db.prepare('INSERT INTO itinerary_items(trip_id,date,time,title,description,category,sort_order) VALUES(?,?,?,?,?,?,?)').run(req.params.id,d.date||'',d.time||'',d.title,d.description||'',d.category||'',Number(d.sort_order)||0);ok(res,{item:db.prepare('SELECT * FROM itinerary_items WHERE id=?').get(r.lastInsertRowid)});});
+app.patch('/api/items/:id',(req,res)=>{const d=req.body;db.prepare('UPDATE itinerary_items SET date=COALESCE(?,date),time=COALESCE(?,time),title=COALESCE(?,title),description=COALESCE(?,description),category=COALESCE(?,category),sort_order=COALESCE(?,sort_order) WHERE id=?').run(d.date,d.time,d.title,d.description,d.category,d.sort_order,req.params.id);ok(res,{item:db.prepare('SELECT * FROM itinerary_items WHERE id=?').get(req.params.id)});});
+app.delete('/api/items/:id',(req,res)=>{db.prepare('DELETE FROM itinerary_items WHERE id=?').run(req.params.id);ok(res,{});});
+app.get('/api/trips/:id/expenses',(req,res)=>ok(res,{expenses:db.prepare('SELECT * FROM expenses WHERE trip_id=? ORDER BY created_at DESC').all(req.params.id)}));
+app.post('/api/trips/:id/expenses',(req,res)=>{const d=req.body;if(!Number.isFinite(Number(d.amount_jpy)))return fail(res,'amount_jpy 為必填');const r=db.prepare('INSERT INTO expenses(trip_id,date,category,amount_jpy,twd,rate,note,created_at) VALUES(?,?,?,?,?,?,?,?)').run(req.params.id,d.date||'',d.category||'其他',Number(d.amount_jpy),Number(d.twd)||0,Number(d.rate)||0,d.note||'',d.created_at||new Date().toISOString());ok(res,{expense:db.prepare('SELECT * FROM expenses WHERE id=?').get(r.lastInsertRowid)});});
+app.delete('/api/expenses/:id',(req,res)=>{db.prepare('DELETE FROM expenses WHERE id=?').run(req.params.id);ok(res,{});});
+const port=Number(process.env.PORT)||8787; app.listen(port,()=>console.log(`SQLite API listening on http://localhost:${port}`));
